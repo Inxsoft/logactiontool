@@ -50,8 +50,12 @@ class EventLogService {
     final sinceStr = since.toIso8601String();
 
     // Use a FilterHashtable with StartTime for efficiency; no MaxEvents limit.
+    // Force UTF-8 output so Dart can decode it reliably regardless of the
+    // system OEM codepage.
     final script = r'''
 param([string]$Since)
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
 $since = [datetime]::Parse($Since)
 try {
   $events = Get-WinEvent -FilterHashtable @{
@@ -69,14 +73,19 @@ try {
 }
 ''';
 
+    // Receive raw bytes; decode as UTF-8 with allowMalformed so a single
+    // bad character in one log message never drops the entire result.
     final result = await Process.run(
       'powershell.exe',
       ['-NoProfile', '-NonInteractive', '-Command', script, '-Since', sinceStr],
-      stdoutEncoding: utf8,
-      stderrEncoding: utf8,
     );
 
-    final output = (result.stdout as String).trim();
+    final output = utf8.decode(
+      result.stdout is List<int>
+          ? result.stdout as List<int>
+          : (result.stdout as String).codeUnits,
+      allowMalformed: true,
+    ).trim();
     if (output.isEmpty || output == '[]') return [];
 
     try {
