@@ -192,7 +192,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
   void _showUniqueIpsDialog() async {
     final counts = _ipFailedCounts;
 
-    // Load current banned CIDRs first so we can mark already-banned IPs.
     showDialog<void>(
       context: context,
       barrierDismissible: false,
@@ -211,25 +210,74 @@ class _DashboardScreenState extends State<DashboardScreen> {
     showDialog<void>(
       context: context,
       builder: (outerCtx) {
-        // Mutable set — lives in the outer builder closure, survives
-        // StatefulBuilder rebuilds.
+        // All mutable dialog-local state lives here, outside StatefulBuilder,
+        // so it survives rebuilds.
         var banned = initialBanned.toSet();
+        var sortBy = 'attempts'; // 'attempts' | 'ip'
+        var groupBy = 'none';   // 'none' | 'network'
 
-        Future<void> doBan(String ip, String cidr, void Function(void Function()) setDialogState) async {
+        // ── helpers ──────────────────────────────────────────────────────────
+
+        int compareIp(String a, String b) {
+          final pa = a.split('.').map((s) => int.tryParse(s) ?? 0).toList();
+          final pb = b.split('.').map((s) => int.tryParse(s) ?? 0).toList();
+          for (var i = 0; i < 4 && i < pa.length && i < pb.length; i++) {
+            final d = pa[i] - pb[i];
+            if (d != 0) return d;
+          }
+          return 0;
+        }
+
+        List<MapEntry<String, int>> sorted() {
+          final entries = counts.entries.toList();
+          if (sortBy == 'ip') {
+            entries.sort((a, b) => compareIp(a.key, b.key));
+          }
+          // 'attempts' is already sorted descending from _ipFailedCounts
+          return entries;
+        }
+
+        /// Groups by /24 prefix. Group order follows current sort:
+        /// by attempts → groups sorted by total desc;
+        /// by ip       → groups sorted by network address.
+        Map<String, List<MapEntry<String, int>>> grouped() {
+          final map = <String, List<MapEntry<String, int>>>{};
+          for (final e in sorted()) {
+            final net = _cidr24(e.key);
+            map.putIfAbsent(net, () => []).add(e);
+          }
+          final networks = map.keys.toList();
+          if (sortBy == 'ip') {
+            networks.sort((a, b) => compareIp(
+                a.split('/').first, b.split('/').first));
+          } else {
+            networks.sort((a, b) {
+              final ta = map[a]!.fold(0, (s, e) => s + e.value);
+              final tb = map[b]!.fold(0, (s, e) => s + e.value);
+              return tb - ta;
+            });
+          }
+          return {for (final n in networks) n: map[n]!};
+        }
+
+        // ── ban action ───────────────────────────────────────────────────────
+
+        Future<void> doBan(String ip, String cidr,
+            void Function(void Function()) setDialogState) async {
           final confirmed = await showDialog<bool>(
             context: context,
             builder: (_) => AlertDialog(
-              title: Row(children: [
-                const Icon(Icons.block, color: Colors.red, size: 20),
-                const SizedBox(width: 8),
-                const Text('Confirm Ban'),
+              title: const Row(children: [
+                Icon(Icons.block, color: Colors.red, size: 20),
+                SizedBox(width: 8),
+                Text('Confirm Ban'),
               ]),
               content: Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text('Source IP: $ip'),
-                  const SizedBox(height: 8),
+                  if (ip != cidr.split('/').first) Text('Source IP: $ip'),
+                  const SizedBox(height: 4),
                   Text(cidr,
                       style: const TextStyle(
                           fontFamily: 'monospace',
@@ -237,7 +285,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                           fontSize: 16)),
                   const SizedBox(height: 12),
                   Text(
-                    'This will create an inbound block rule in Windows Firewall for $cidr.',
+                    'Creates an inbound block rule in Windows Firewall for $cidr.',
                     style: const TextStyle(color: Colors.black54, fontSize: 13),
                   ),
                 ],
@@ -264,21 +312,169 @@ class _DashboardScreenState extends State<DashboardScreen> {
           }
           if (!mounted) return;
           ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-            content: Text(ok ? 'Banned $cidr' : 'Failed to ban $cidr — check admin rights'),
-            backgroundColor: ok ? Colors.green.shade700 : Colors.red.shade700,
+            content: Text(ok
+                ? 'Banned $cidr'
+                : 'Failed to ban $cidr — check admin rights'),
+            backgroundColor:
+                ok ? Colors.green.shade700 : Colors.red.shade700,
             duration: const Duration(seconds: 3),
           ));
         }
 
+        // ── IP row widget ─────────────────────────────────────────────────────
+
+        Widget ipRow(String ip, int attempts, bool indent,
+            void Function(void Function()) setDialogState) {
+          final cidr32 = _cidr32(ip);
+          final cidr24 = _cidr24(ip);
+          final cidr16 = _cidr16(ip);
+          final b32 = banned.contains(cidr32);
+          final b24 = banned.contains(cidr24);
+          final b16 = banned.contains(cidr16);
+          final anyBanned = b32 || b24 || b16;
+
+          return Container(
+            color: anyBanned ? Colors.green.shade50 : null,
+            padding: EdgeInsets.only(
+                left: indent ? 28 : 12, right: 12, top: 7, bottom: 7),
+            child: Row(children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(children: [
+                      Text(ip,
+                          style: const TextStyle(
+                              fontFamily: 'monospace',
+                              fontWeight: FontWeight.w600,
+                              fontSize: 13)),
+                      const SizedBox(width: 8),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 6, vertical: 1),
+                        decoration: BoxDecoration(
+                          color: Colors.red.shade50,
+                          border: Border.all(color: Colors.red.shade200),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Text('$attempts',
+                            style: TextStyle(
+                                color: Colors.red.shade700,
+                                fontSize: 11,
+                                fontWeight: FontWeight.bold)),
+                      ),
+                    ]),
+                    if (anyBanned) ...[
+                      const SizedBox(height: 3),
+                      Wrap(spacing: 4, children: [
+                        if (b32) _bannedBadge('IP'),
+                        if (b24) _bannedBadge('/24'),
+                        if (b16) _bannedBadge('/16'),
+                      ]),
+                    ],
+                  ],
+                ),
+              ),
+              _ipBanButton('Ban IP', Colors.red.shade700, b32, cidr32,
+                  () => doBan(ip, cidr32, setDialogState)),
+              const SizedBox(width: 4),
+              _ipBanButton('Ban /24', Colors.orange.shade700, b24, cidr24,
+                  () => doBan(ip, cidr24, setDialogState)),
+              const SizedBox(width: 4),
+              _ipBanButton('Ban /16', Colors.deepOrange.shade700, b16, cidr16,
+                  () => doBan(ip, cidr16, setDialogState)),
+            ]),
+          );
+        }
+
+        // ── network group header ──────────────────────────────────────────────
+
+        Widget networkHeader(String net, int total,
+            void Function(void Function()) setDialogState) {
+          final b24 = banned.contains(net);
+          return Container(
+            color: const Color(0xFF1A1D2E).withValues(alpha: 0.06),
+            padding:
+                const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            child: Row(children: [
+              const Icon(Icons.router, size: 14, color: Colors.black45),
+              const SizedBox(width: 6),
+              Text(net,
+                  style: const TextStyle(
+                      fontFamily: 'monospace',
+                      fontWeight: FontWeight.w700,
+                      fontSize: 12)),
+              const SizedBox(width: 10),
+              if (b24) _bannedBadge('/24'),
+              const Spacer(),
+              Text('$total attempt${total == 1 ? '' : 's'}',
+                  style: const TextStyle(
+                      fontSize: 11, color: Colors.black45)),
+              const SizedBox(width: 10),
+              _ipBanButton('Ban /24', Colors.orange.shade700, b24, net,
+                  // ip == net for the header (no /32 source IP context)
+                  () => doBan(net.split('/').first, net, setDialogState)),
+            ]),
+          );
+        }
+
+        // ── build list items ──────────────────────────────────────────────────
+
+        List<Widget> buildItems(
+            void Function(void Function()) setDialogState) {
+          if (counts.isEmpty) {
+            return [
+              const Padding(
+                  padding: EdgeInsets.all(24),
+                  child: Text('No IPs recorded yet.'))
+            ];
+          }
+
+          if (groupBy == 'network') {
+            final groups = grouped();
+            final items = <Widget>[];
+            var first = true;
+            for (final entry in groups.entries) {
+              if (!first) items.add(const Divider(height: 1));
+              first = false;
+              final net = entry.key;
+              final ips = entry.value;
+              final total = ips.fold(0, (s, e) => s + e.value);
+              items.add(networkHeader(net, total, setDialogState));
+              for (var j = 0; j < ips.length; j++) {
+                items.add(ipRow(ips[j].key, ips[j].value, true, setDialogState));
+                if (j < ips.length - 1) {
+                  items.add(const Divider(height: 1, indent: 28));
+                }
+              }
+            }
+            return items;
+          } else {
+            final entries = sorted();
+            final items = <Widget>[];
+            for (var i = 0; i < entries.length; i++) {
+              items.add(
+                  ipRow(entries[i].key, entries[i].value, false, setDialogState));
+              if (i < entries.length - 1) {
+                items.add(const Divider(height: 1, indent: 12));
+              }
+            }
+            return items;
+          }
+        }
+
+        // ── dialog ────────────────────────────────────────────────────────────
+
         return StatefulBuilder(builder: (ctx, setDialogState) {
           return Dialog(
             child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 600, maxHeight: 540),
+              constraints:
+                  const BoxConstraints(maxWidth: 640, maxHeight: 580),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  // Header
+                  // Dark header
                   Container(
                     decoration: const BoxDecoration(
                       color: Color(0xFF1A1D2E),
@@ -288,118 +484,84 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     padding: const EdgeInsets.symmetric(
                         horizontal: 20, vertical: 14),
                     child: Row(children: [
-                      const Icon(Icons.language, color: Colors.blue, size: 20),
+                      const Icon(Icons.language,
+                          color: Colors.blue, size: 20),
                       const SizedBox(width: 8),
                       Text('Unique IPs  (${counts.length})',
                           style: const TextStyle(
                               color: Colors.white,
                               fontWeight: FontWeight.bold,
                               fontSize: 15)),
-                      const Spacer(),
-                      const Text('Failed attempts',
-                          style: TextStyle(
-                              color: Colors.white38, fontSize: 12)),
                     ]),
                   ),
+                  // Toolbar
+                  Padding(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 12, vertical: 8),
+                    child: Row(children: [
+                      const Text('Sort:',
+                          style: TextStyle(
+                              fontSize: 12, color: Colors.black54)),
+                      const SizedBox(width: 8),
+                      SegmentedButton<String>(
+                        segments: const [
+                          ButtonSegment(
+                              value: 'attempts',
+                              label: Text('Attempts'),
+                              icon: Icon(Icons.arrow_downward, size: 13)),
+                          ButtonSegment(
+                              value: 'ip',
+                              label: Text('IP'),
+                              icon: Icon(Icons.sort, size: 13)),
+                        ],
+                        selected: {sortBy},
+                        onSelectionChanged: (s) =>
+                            setDialogState(() => sortBy = s.first),
+                        style: ButtonStyle(
+                          visualDensity: VisualDensity.compact,
+                          textStyle: WidgetStateProperty.all(
+                              const TextStyle(fontSize: 12)),
+                        ),
+                      ),
+                      const SizedBox(width: 20),
+                      const Text('Group:',
+                          style: TextStyle(
+                              fontSize: 12, color: Colors.black54)),
+                      const SizedBox(width: 8),
+                      SegmentedButton<String>(
+                        segments: const [
+                          ButtonSegment(
+                              value: 'none',
+                              label: Text('Flat'),
+                              icon: Icon(Icons.list, size: 13)),
+                          ButtonSegment(
+                              value: 'network',
+                              label: Text('/24 Networks'),
+                              icon: Icon(Icons.account_tree, size: 13)),
+                        ],
+                        selected: {groupBy},
+                        onSelectionChanged: (s) =>
+                            setDialogState(() => groupBy = s.first),
+                        style: ButtonStyle(
+                          visualDensity: VisualDensity.compact,
+                          textStyle: WidgetStateProperty.all(
+                              const TextStyle(fontSize: 12)),
+                        ),
+                      ),
+                    ]),
+                  ),
+                  const Divider(height: 1),
                   // List
                   Flexible(
-                    child: counts.isEmpty
-                        ? const Padding(
-                            padding: EdgeInsets.all(24),
-                            child: Text('No IPs recorded yet.'),
-                          )
-                        : ListView.separated(
-                            shrinkWrap: true,
-                            itemCount: counts.length,
-                            separatorBuilder: (_, x) =>
-                                const Divider(height: 1, indent: 16),
-                            itemBuilder: (_, i) {
-                              final ip = counts.keys.elementAt(i);
-                              final attempts = counts.values.elementAt(i);
-                              final cidr32 = _cidr32(ip);
-                              final cidr24 = _cidr24(ip);
-                              final cidr16 = _cidr16(ip);
-                              final banned32 = banned.contains(cidr32);
-                              final banned24 = banned.contains(cidr24);
-                              final banned16 = banned.contains(cidr16);
-                              final anyBanned = banned32 || banned24 || banned16;
-
-                              return Container(
-                                color: anyBanned
-                                    ? Colors.green.shade50
-                                    : null,
-                                padding: const EdgeInsets.symmetric(
-                                    horizontal: 12, vertical: 7),
-                                child: Row(children: [
-                                  // IP + attempt count + ban badges
-                                  Expanded(
-                                    child: Column(
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.start,
-                                      children: [
-                                        Row(children: [
-                                          Text(ip,
-                                              style: const TextStyle(
-                                                fontFamily: 'monospace',
-                                                fontWeight: FontWeight.w600,
-                                                fontSize: 13,
-                                              )),
-                                          const SizedBox(width: 8),
-                                          // Attempt count badge
-                                          Container(
-                                            padding: const EdgeInsets.symmetric(
-                                                horizontal: 6, vertical: 1),
-                                            decoration: BoxDecoration(
-                                              color: Colors.red.shade50,
-                                              border: Border.all(
-                                                  color: Colors.red.shade200),
-                                              borderRadius:
-                                                  BorderRadius.circular(10),
-                                            ),
-                                            child: Text('$attempts',
-                                                style: TextStyle(
-                                                    color: Colors.red.shade700,
-                                                    fontSize: 11,
-                                                    fontWeight:
-                                                        FontWeight.bold)),
-                                          ),
-                                        ]),
-                                        // Ban coverage badges
-                                        if (anyBanned) ...[
-                                          const SizedBox(height: 3),
-                                          Wrap(spacing: 4, children: [
-                                            if (banned32)
-                                              _bannedBadge('IP'),
-                                            if (banned24)
-                                              _bannedBadge('/24'),
-                                            if (banned16)
-                                              _bannedBadge('/16'),
-                                          ]),
-                                        ],
-                                      ],
-                                    ),
-                                  ),
-                                  // Ban buttons
-                                  _ipBanButton('Ban IP', Colors.red.shade700,
-                                      banned32, cidr32,
-                                      () => doBan(ip, cidr32, setDialogState)),
-                                  const SizedBox(width: 4),
-                                  _ipBanButton('Ban /24',
-                                      Colors.orange.shade700, banned24, cidr24,
-                                      () => doBan(ip, cidr24, setDialogState)),
-                                  const SizedBox(width: 4),
-                                  _ipBanButton('Ban /16',
-                                      Colors.deepOrange.shade700, banned16,
-                                      cidr16,
-                                      () => doBan(ip, cidr16, setDialogState)),
-                                ]),
-                              );
-                            },
-                          ),
+                    child: ListView(
+                      shrinkWrap: true,
+                      children: buildItems(setDialogState),
+                    ),
                   ),
                   // Footer
+                  const Divider(height: 1),
                   Padding(
-                    padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+                    padding: const EdgeInsets.fromLTRB(16, 8, 16, 10),
                     child: Align(
                       alignment: Alignment.centerRight,
                       child: TextButton(
