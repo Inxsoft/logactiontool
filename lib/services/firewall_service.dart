@@ -1,55 +1,51 @@
 import 'dart:io';
 
-/// Stub for firewall rule management — will be wired up in a future phase.
-/// Uses `netsh advfirewall` under the hood (requires admin elevation).
+/// Windows Firewall rule management via `netsh advfirewall`.
+/// Requires the app to run with administrator elevation.
 class FirewallService {
-  /// Block all inbound traffic from [ipAddress].
-  Future<bool> blockIp(String ipAddress) async {
-    final ruleName = 'LogActionTool_Block_$ipAddress';
+  // Rule names cannot contain slashes, so we encode the CIDR by replacing
+  // '/' with '_'. e.g. "45.227.254.0/24" → "LogActionTool_Block_45.227.254.0_24"
+  static String _ruleName(String cidr) =>
+      'LogActionTool_Block_${cidr.replaceAll('/', '_')}';
+
+  /// Block all inbound traffic matching [cidr] (e.g. "1.2.3.4/32", "1.2.3.0/24").
+  Future<bool> blockCidr(String cidr) async {
     final result = await Process.run('netsh', [
-      'advfirewall',
-      'firewall',
-      'add',
-      'rule',
-      'name=$ruleName',
+      'advfirewall', 'firewall', 'add', 'rule',
+      'name=${_ruleName(cidr)}',
       'dir=in',
       'action=block',
-      'remoteip=$ipAddress',
+      'remoteip=$cidr',
       'enable=yes',
       'profile=any',
     ]);
     return result.exitCode == 0;
   }
 
-  /// Remove a previously created block rule for [ipAddress].
-  Future<bool> unblockIp(String ipAddress) async {
-    final ruleName = 'LogActionTool_Block_$ipAddress';
+  /// Remove the block rule for [cidr].
+  Future<bool> unblockCidr(String cidr) async {
     final result = await Process.run('netsh', [
-      'advfirewall',
-      'firewall',
-      'delete',
-      'rule',
-      'name=$ruleName',
+      'advfirewall', 'firewall', 'delete', 'rule',
+      'name=${_ruleName(cidr)}',
     ]);
     return result.exitCode == 0;
   }
 
-  /// Returns all IPs currently blocked by LogActionTool rules.
-  Future<List<String>> blockedIps() async {
-    final result = await Process.run('netsh', [
-      'advfirewall',
-      'firewall',
-      'show',
-      'rule',
-      'name=all',
-    ]);
+  /// Returns all CIDRs currently blocked by LogActionTool firewall rules.
+  Future<List<String>> blockedCidrs() async {
+    final result = await Process.run(
+      'netsh',
+      ['advfirewall', 'firewall', 'show', 'rule', 'name=all'],
+      stdoutEncoding: systemEncoding,
+      stderrEncoding: systemEncoding,
+    );
     final output = result.stdout as String;
     final blocked = <String>[];
-    final ruleBlocks = output.split(RegExp(r'\r?\n\r?\n'));
-    for (final block in ruleBlocks) {
+    // netsh separates rules by blank lines
+    for (final block in output.split(RegExp(r'\r?\n\r?\n'))) {
       if (!block.contains('LogActionTool_Block_')) continue;
-      final ipMatch = RegExp(r'RemoteIP:\s+(\S+)').firstMatch(block);
-      if (ipMatch != null) blocked.add(ipMatch.group(1)!);
+      final m = RegExp(r'RemoteIP:\s+(\S+)').firstMatch(block);
+      if (m != null) blocked.add(m.group(1)!);
     }
     return blocked;
   }
