@@ -62,10 +62,17 @@ class SecurityEvent {
   }
 
   static String? _extractUsername(String message) {
-    final match = RegExp(
-      r'Account Name:\s+(\S+)',
-    ).firstMatch(message);
-    final name = match?.group(1);
+    // For 4625 failed logons the interesting account is under
+    // "Account For Which Logon Failed:" — find all non-dash Account Name values.
+    final matches = RegExp(r'Account Name:\s+([^\r\n]+)').allMatches(message);
+    String? name;
+    for (final m in matches) {
+      final candidate = m.group(1)?.trim();
+      if (candidate != null && candidate != '-' && candidate.isNotEmpty) {
+        name = candidate;
+        break;
+      }
+    }
     if (name == null || name == '-') return null;
     return name;
   }
